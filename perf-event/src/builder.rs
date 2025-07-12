@@ -194,7 +194,8 @@ impl<'a> Builder<'a> {
         let mut id = 0_u64;
         check_errno_syscall(|| unsafe { sys::ioctls::ID(file.as_raw_fd(), &mut id) })?;
 
-        Ok(Counter::new(file, id))
+        let read_format = ReadFormat::from_bits_retain(self.attrs.read_format);
+        Ok(Counter::new(file, id, read_format))
     }
 }
 

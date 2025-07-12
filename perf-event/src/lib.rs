@@ -101,6 +101,7 @@ pub mod hooks;
 mod builder;
 mod counter;
 mod flags;
+mod read;
 
 // When the `"hooks"` feature is not enabled, call directly into
 // `perf-event-open-sys`.
@@ -113,7 +114,7 @@ use perf_event_open_sys as sys;
 use hooks::sys;
 
 pub use crate::builder::Builder;
-pub use crate::counter::Counter;
+pub use crate::counter::{Counter, CounterValue};
 pub use crate::flags::{Clock, ReadFormat, SampleBranchFlag, SampleSkid};
 
 /// A group of counters that can be managed as a unit.

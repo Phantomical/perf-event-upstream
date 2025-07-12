@@ -114,7 +114,7 @@ use perf_event_open_sys as sys;
 use hooks::sys;
 
 pub use crate::builder::Builder;
-pub use crate::counter::{Counter, CounterValue};
+pub use crate::counter::{Counter, CounterValue, CountAndTime};
 pub use crate::flags::{Clock, ReadFormat, SampleBranchFlag, SampleSkid};
 
 /// A group of counters that can be managed as a unit.
@@ -296,35 +296,6 @@ pub struct Group {
 pub struct Counts {
     // Raw results from the `read`.
     data: Vec<u64>,
-}
-
-/// The value of a counter, along with timesharing data.
-///
-/// Some counters are implemented in hardware, and the processor can run
-/// only a fixed number of them at a time. If more counters are requested
-/// than the hardware can support, the kernel timeshares them on the
-/// hardware.
-///
-/// This struct holds the value of a counter, together with the time it was
-/// enabled, and the proportion of that for which it was actually running.
-#[repr(C)]
-pub struct CountAndTime {
-    /// The counter value.
-    ///
-    /// The meaning of this field depends on how the counter was configured when
-    /// it was built; see ['Builder'].
-    pub count: u64,
-
-    /// How long this counter was enabled by the program, in nanoseconds.
-    pub time_enabled: u64,
-
-    /// How long the kernel actually ran this counter, in nanoseconds.
-    ///
-    /// If `time_enabled == time_running`, then the counter ran for the entire
-    /// period it was enabled, without interruption. Otherwise, the counter
-    /// shared the underlying hardware with others, and you should prorate its
-    /// value accordingly.
-    pub time_running: u64,
 }
 
 impl Group {

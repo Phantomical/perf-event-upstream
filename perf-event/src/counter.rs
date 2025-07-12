@@ -8,7 +8,7 @@ use std::time::Duration;
 use perf_event_open_sys::bindings::PERF_IOC_FLAG_GROUP;
 
 use crate::sys::ioctls;
-use crate::{check_errno_syscall, CountAndTime, ReadFormat};
+use crate::{check_errno_syscall, ReadFormat};
 
 used_in_docs!(ReadFormat);
 
@@ -560,4 +560,33 @@ impl fmt::Debug for CounterValue {
         dbg.field("lost", &self.0.lost());
         dbg.finish_non_exhaustive()
     }
+}
+
+/// The value of a counter, along with timesharing data.
+///
+/// Some counters are implemented in hardware, and the processor can run
+/// only a fixed number of them at a time. If more counters are requested
+/// than the hardware can support, the kernel timeshares them on the
+/// hardware.
+///
+/// This struct holds the value of a counter, together with the time it was
+/// enabled, and the proportion of that for which it was actually running.
+#[repr(C)]
+pub struct CountAndTime {
+    /// The counter value.
+    ///
+    /// The meaning of this field depends on how the counter was configured when
+    /// it was built; see ['Builder'].
+    pub count: u64,
+
+    /// How long this counter was enabled by the program, in nanoseconds.
+    pub time_enabled: u64,
+
+    /// How long the kernel actually ran this counter, in nanoseconds.
+    ///
+    /// If `time_enabled == time_running`, then the counter ran for the entire
+    /// period it was enabled, without interruption. Otherwise, the counter
+    /// shared the underlying hardware with others, and you should prorate its
+    /// value accordingly.
+    pub time_running: u64,
 }

@@ -1,8 +1,11 @@
 use std::ffi::c_int;
 use std::ffi::c_ulong;
+use std::fmt;
 use std::fs::File;
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
 
 use libc::pid_t;
 use sys::bindings::perf_event_attr;
@@ -155,47 +158,174 @@ impl<'a> Builder<'a> {
     /// Construct a [`Counter`] according to the specifications made on this
     /// `Builder`.
     ///
-    /// A freshly built `Counter` is disabled. To begin counting events, you
-    /// must call [`enable`] on the `Counter` or the `Group` to which it belongs.
+    /// If you want to add this counter to a group use [`build_with_group`]
+    /// instead.
     ///
-    /// If the `Builder` requests features that the running kernel does not
-    /// support, it returns `Err(e)` where `e.kind() == ErrorKind::Other` and
-    /// `e.raw_os_error() == Some(libc::E2BIG)`.
+    /// By default, a newly built [`Counter`] is disabled. To begin counting
+    /// events, you must call [`enable`] on the [`Counter`] or the [`Group`]
+    /// to which it belongs. Alternatively, certain options (e.g.
+    /// [`enable_on_exec`]) may be used to automatically enable the [`Counter`]
+    /// once certain events occur.
     ///
-    /// Unfortunately, problems in counter configuration are detected at this
-    /// point, by the kernel, not earlier when the offending request is made on
-    /// the `Builder`. The kernel's returned errors are not always helpful.
+    /// [`build_with_group`]: Self::build_with_group
     ///
-    /// [`Counter`]: struct.Counter.html
-    /// [`enable`]: struct.Counter.html#method.enable
-    pub fn build(mut self) -> std::io::Result<Counter> {
+    /// # Errors
+    /// - The `perf_event_open` syscall has a large number of different errors
+    ///   it can return. See the [man page][0] for details. Unfortunately, the
+    ///   errors returned by the kernel are not always helpful.
+    /// - This method translates `E2BIG` errors (which means the kernel did not
+    ///   support some options) into a custom [`std::io::Error`] with kind
+    ///   [`ErrorKind::Unsupported`] and an internal error of
+    ///   [`UnsupportedOptionsError`]. This allows you to access the size of the
+    ///   [`perf_event_attr`] struct that the kernel was expecting.
+    ///
+    /// # Panics
+    /// This method panics if `attrs.size` has been set to a value larger than
+    /// the size of the [`perf_event_attr`] struct.
+    ///
+    /// [`Group`]: crate::Group
+    /// [`Group::add`]: crate::Group::add
+    /// [`enable`]: crate::Counter::enable
+    /// [`enable_on_exec`]: Builder::enable_on_exec
+    /// [0]: https://www.mankier.com/2/perf_event_open
+    pub fn build(&self) -> std::io::Result<Counter> {
+        let read_format = ReadFormat::from_bits_retain(self.attrs.read_format);
+        Counter::new_internal(self.build_impl(None)?, read_format)
+    }
+
+    /// Construct a [`Counter`] as part of a group.
+    ///
+    /// The `group` passed in must be the leader of the group you to add the
+    /// resulting [`Counter`] to.
+    ///
+    /// ## Notes
+    /// - The group leader does not have to be a [`Group`] (although it can be),
+    ///   any [`Counter`] will work just fine as a group leader provided it is
+    ///   not already within a group itself.
+    /// - Similarly with enabling, disabling, or resetting all counters in the
+    ///   group. Any counter in the group can do those via [`enable_group`],
+    ///   [`disable_group`], and [`reset_group`].
+    /// - The same applies for reading group values. Any counter that has
+    ///   [`ReadFormat::GROUP`] set in [`read_format`](Self::read_format)can
+    ///   read the counter values for the entire group using [`read_group`].
+    ///
+    /// Note, however, that [`Group`] is likely to be more convenient if you
+    /// don't want to set [`ReadFormat::GROUP`] on any of the counters
+    /// within the group.
+    ///
+    /// [`enable_group`]: crate::Counter::enable_group
+    /// [`disable_group`]: crate::Counter::disable_group
+    /// [`reset_group`]: crate::Counter::reset_group
+    /// [`read_group`]: crate::Counter::read_group
+    /// [`ReadFormat::GROUP`]: crate::ReadFormat::GROUP
+    ///
+    /// # Errors
+    /// - The `perf_event_open` syscall has a large number of different errors
+    ///   it can return. See the [man page][0] for details. Unfortunately, the
+    ///   errors returned by the kernel are not always helpful.
+    /// - This method translates `E2BIG` errors (which means the kernel did not
+    ///   support some options) into a custom [`std::io::Error`] with kind
+    ///   [`ErrorKind::Unsupported`] and an internal error of
+    ///   [`UnsupportedOptionsError`]. This allows you to access the size of the
+    ///   [`perf_event_attr`] struct that the kernel was expecting.
+    ///
+    /// [0]: https://www.mankier.com/2/perf_event_open
+    ///
+    /// # Panics
+    /// This method panics if `attrs.size` has been set to a value larger than
+    /// the size of the [`perf_event_attr`] struct.
+    pub fn build_with_group(&self, mut group: impl AsMut<Counter>) -> io::Result<Counter> {
+        let group: &mut Counter = group.as_mut();
+        let file = self.build_impl(Some(group.as_raw_fd()))?;
+
+        group.member_count = group
+            .member_count
+            .checked_add(1)
+            .expect("cannot add more than u32::MAX elements to a group");
+
+        let read_format = ReadFormat::from_bits_retain(self.attrs.read_format);
+        Counter::new_internal(file, read_format)
+    }
+
+    /// Build a [`Group`] according to the specifications made on this
+    /// `Builder`.
+    ///
+    /// Note that you will need to have set [`ReadFormat::GROUP`] within
+    /// [`read_format`] to or this method will error.
+    ///
+    /// [`read_format`]: Self::read_format
+    ///
+    /// # Notes
+    /// - A [`Group`] is just a wrapper around a [`Counter`] whose methods use
+    ///   the corresponding `*_group` methods on [`Counter`].
+    /// - The [`GroupData`] returned from [`Group::read`] doesn't include the
+    ///   group itself when being iterated over. You will likely want to use the
+    ///   [`Software::DUMMY`] event when constructing a group.
+    ///
+    /// # Errors
+    /// - All errors that can be returned from [`build`](Self::build).
+    /// - An error will be returned if [`ReadFormat::GROUP`] is not set within
+    ///   `read_format`. It will have a kind of [`ErrorKind::Other`].
+    ///
+    /// # Panics
+    /// This method panics if `attrs.size` has been set to a value larger than
+    /// the size of the [`perf_event_attr`] struct.
+    ///
+    /// [`GroupData`]: crate::GroupData
+    /// [`Software::DUMMY`]: crate::events::Software::DUMMY
+    pub fn build_group(&self) -> io::Result<Group> {
+        let read_format = ReadFormat::from_bits_retain(self.attrs.read_format);
+        if !read_format.contains(ReadFormat::GROUP) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "groups must be created with the GROUP flag enabled",
+            ));
+        }
+
+        Ok(Group(self.build()?))
+    }
+
+    fn build_impl(&self, group_fd: Option<RawFd>) -> io::Result<File> {
+        // Users of this crate can modify attrs.size (e.g. to use it for feature
+        // detection) but in order for the perf_event_open call to be safe it
+        // must not exceed the size of perf_event_attr.
+
+        assert!(self.attrs.size <= std::mem::size_of::<perf_event_attr>() as u32);
+
         let cpu = match self.cpu {
             Some(cpu) => cpu as c_int,
             None => -1,
         };
+
         let (pid, flags) = self.who.as_args();
-        let group_fd = match self.group {
-            Some(ref mut g) => {
-                g.max_members += 1;
-                g.file.as_raw_fd() as c_int
-            }
-            None => -1,
-        };
+        let group_fd = group_fd.unwrap_or(-1);
 
-        let file = unsafe {
-            File::from_raw_fd(check_errno_syscall(|| {
-                sys::perf_event_open(&mut self.attrs, pid, cpu, group_fd, flags as c_ulong)
-            })?)
-        };
+        // Enable CLOEXEC by default. This the behaviour that the rust stdlib
+        // uses for all its file descriptors.
+        //
+        // If you need to get a perf_event_open fd which does not have CLOEXEC
+        // set then you can modify the flags after the fact with fcntl(2).
 
-        // If we're going to be part of a Group, retrieve the ID the kernel
-        // assigned us, so we can find our results in a Counts structure. Even
-        // if we're not part of a group, we'll use it in `Debug` output.
-        let mut id = 0_u64;
-        check_errno_syscall(|| unsafe { sys::ioctls::ID(file.as_raw_fd(), &mut id) })?;
+        let flags = flags | sys::bindings::PERF_FLAG_FD_CLOEXEC;
 
-        let read_format = ReadFormat::from_bits_retain(self.attrs.read_format);
-        Ok(Counter::new(file, id, read_format))
+        let mut attrs = self.attrs;
+
+        let result = check_errno_syscall(|| unsafe {
+            sys::perf_event_open(&mut attrs, pid, cpu, group_fd, flags as c_ulong)
+        });
+
+        match result {
+            Ok(fd) => unsafe { Ok(File::from_raw_fd(fd)) },
+
+            // In case of an E2BIG error we return a custom error so that users
+            // can get at the size expected by the kernel if they want to.
+            Err(e) if e.raw_os_error() == Some(libc::E2BIG) => Err(std::io::Error::new(
+                io::ErrorKind::Unsupported,
+                UnsupportedOptionsError::new(attrs.size),
+            )),
+
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -846,3 +976,61 @@ impl<'a> EventPid<'a> {
         }
     }
 }
+
+/// An error for when the kernel indicates that the counter was constructed
+/// with options it does not support.
+///
+/// This error is returned as the inner error from [`Builder::build`] or
+/// [`Group::add`] if the kernel indicates that the [`perf_event_attr`]
+/// arguments contained options that the current kernel does not support.
+///
+/// This can be used to implement feature detection and fall back to a config
+/// which uses fewer options.
+///
+/// [`Group::add`]: crate::Group::add
+///
+/// # Example
+/// ```
+/// use perf_event::events::Software;
+/// use perf_event::{Builder, UnsupportedOptionsError};
+///
+/// let mut builder = Builder::new(Software::DUMMY);
+///
+/// // The linux kernel will always return E2BIG when the size is less than
+/// // PERF_ATTR_SIZE_VER0 (64) except if it is 0. This allows us to easily
+/// // make an invalid call do figure out what size the kernel is expecting.
+/// builder.attrs_mut().size = 1;
+///
+/// let error = builder.build().unwrap_err();
+///
+/// assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+/// assert_eq!(error.raw_os_error(), None);
+///
+/// let inner: &UnsupportedOptionsError = error.get_ref().unwrap().downcast_ref().unwrap();
+///
+/// println!("The expected size was {}", inner.expected_size());
+/// ```
+
+#[derive(Debug)]
+pub struct UnsupportedOptionsError {
+    expected_size: u32,
+}
+
+impl UnsupportedOptionsError {
+    pub(crate) fn new(expected_size: u32) -> Self {
+        Self { expected_size }
+    }
+
+    /// The size that the kernel expected the [`perf_event_attr`] struct to be.
+    pub fn expected_size(&self) -> usize {
+        self.expected_size as _
+    }
+}
+
+impl fmt::Display for UnsupportedOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("perf_event_attr contained options not valid for the current kernel")
+    }
+}
+
+impl std::error::Error for UnsupportedOptionsError {}

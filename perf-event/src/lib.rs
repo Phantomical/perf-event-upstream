@@ -114,7 +114,8 @@ use perf_event_open_sys as sys;
 use hooks::sys;
 
 pub use crate::builder::Builder;
-pub use crate::counter::{Counter, CounterValue, CountAndTime};
+use crate::counter::GroupValue;
+pub use crate::counter::{CountAndTime, Counter, CounterValue};
 pub use crate::flags::{Clock, ReadFormat, SampleBranchFlag, SampleSkid};
 
 /// A group of counters that can be managed as a unit.
@@ -125,51 +126,19 @@ pub use crate::flags::{Clock, ReadFormat, SampleBranchFlag, SampleSkid};
 /// operations are only meaningful on counters that cover exactly the same
 /// period of execution.
 ///
-/// A `Counter` is placed in a group when it is created, by calling the
-/// `Builder`'s [`group`] method. A `Group`'s [`read`] method returns values
-/// of all its member counters at once as a [`Counts`] value, which can be
-/// indexed by `Counter` to retrieve a specific value.
+/// A `Counter` is placed in a group when it is created via the
+/// [`Builder::build_with_group`] method. A `Group`'s [`read`] method returns
+/// values of all its member counters at once as a [`GroupData`] value, which
+/// can be indexed by `Counter` to retrieve a specific value.
 ///
-/// For example, the following program computes the average number of cycles
-/// used per instruction retired for a call to `println!`:
-///
-///     # fn main() -> std::io::Result<()> {
-///     use perf_event::{Builder, Group};
-///     use perf_event::events::Hardware;
-///
-///     let mut group = Group::new()?;
-///     let cycles = Builder::new().group(&mut group).kind(Hardware::CPU_CYCLES).build()?;
-///     let insns = Builder::new().group(&mut group).kind(Hardware::INSTRUCTIONS).build()?;
-///
-///     let vec = (0..=51).collect::<Vec<_>>();
-///
-///     group.enable()?;
-///     println!("{:?}", vec);
-///     group.disable()?;
-///
-///     let counts = group.read()?;
-///     println!("cycles / instructions: {} / {} ({:.2} cpi)",
-///              counts[&cycles],
-///              counts[&insns],
-///              (counts[&cycles] as f64 / counts[&insns] as f64));
-///     # Ok(()) }
-///
-/// The lifetimes of `Counter`s and `Group`s are independent: placing a
-/// `Counter` in a `Group` does not take ownership of the `Counter`, nor must
-/// the `Counter`s in a group outlive the `Group`. If a `Counter` is dropped, it
-/// is simply removed from its `Group`, and omitted from future results. If a
-/// `Group` is dropped, its individual counters continue to count.
+/// The lifetime of a `Group` and its associated `Counter`s are independent:
+/// you can drop them in any order and they will continue to work. A `Counter`
+/// will continue to work after the `Group` is dropped. If a `Counter` is
+/// dropped first then it will simply be removed from the `Group`.
 ///
 /// Enabling or disabling a `Group` affects each `Counter` that belongs to it.
 /// Subsequent reads from the `Counter` will not reflect activity while the
 /// `Group` was disabled, unless the `Counter` is re-enabled individually.
-///
-/// A `Group` and its members must all observe the same tasks and cpus; mixing
-/// these makes building the `Counter` return an error. Unfortunately, there is
-/// no way at present to specify a `Group`'s task and cpu, so you can only use
-/// `Group` on the calling task. If this is a problem, please file an issue.
-///
-/// Internally, a `Group` is just a wrapper around an event file descriptor.
 ///
 /// ## Limits on group size
 ///
@@ -184,59 +153,60 @@ pub use crate::flags::{Clock, ReadFormat, SampleBranchFlag, SampleSkid};
 /// But since the point of a counter group is that its members all cover exactly
 /// the same period of time, this tactic can't be applied to support large
 /// groups. If the kernel cannot schedule a group, its counters remain zero. I
-/// think you can detect this situation by comparing the group's [`time_enabled`]
-/// and [`time_running`] values. It might also be useful to set the `pinned` bit,
-/// which puts the counter in an error state if it's not able to be put on the
-/// CPU; see [#10].
+/// think you can detect this situation by comparing the group's
+/// [`time_enabled`] and [`time_running`] values. If the [`pinned`] option is
+/// set then you will also be able to detect this by [`read`] returning an error
+/// with kind [`UnexpectedEof`].
 ///
 /// According to the `perf_list(1)` man page, you may be able to free up a
 /// hardware counter by disabling the kernel's NMI watchdog, which reserves one
 /// for detecting kernel hangs:
 ///
-/// ```ignore
+/// ```text
 /// $ echo 0 > /proc/sys/kernel/nmi_watchdog
 /// ```
 ///
 /// You can reenable the watchdog when you're done like this:
 ///
-/// ```ignore
+/// ```text
 /// $ echo 1 > /proc/sys/kernel/nmi_watchdog
 /// ```
 ///
-/// [`group`]: Builder::group
+/// [`read`]: Self::read
+/// [`pinned`]: Builder::pinned
+/// [`UnexpectedEof`]: io::ErrorKind::UnexpectedEof
+///
+/// # Examples
+/// Compute the average cycles-per-instruction (CPI) for a call to `println!`:
+/// ```
+/// use perf_event::events::Hardware;
+/// use perf_event::{Builder, Group};
+///
+/// let mut group = Group::new()?;
+/// let cycles = group.add(&Builder::new(Hardware::CPU_CYCLES))?;
+/// let insns = group.add(&Builder::new(Hardware::INSTRUCTIONS))?;
+///
+/// let vec = (0..=51).collect::<Vec<_>>();
+///
+/// group.enable()?;
+/// println!("{:?}", vec);
+/// group.disable()?;
+///
+/// let counts = group.read()?;
+/// println!(
+///     "cycles / instructions: {} / {} ({:.2} cpi)",
+///     counts[&cycles],
+///     counts[&insns],
+///     (counts[&cycles] as f64 / counts[&insns] as f64)
+/// );
+/// # std::io::Result::Ok(())
+/// ```
+///
 /// [`read`]: Group::read
-/// [`#5`]: https://github.com/jimblandy/perf-event/issues/5
-/// [`#10`]: https://github.com/jimblandy/perf-event/issues/10
-/// [`time_enabled`]: Counts::time_enabled
-/// [`time_running`]: Counts::time_running
-pub struct Group {
-    /// The file descriptor for this counter, returned by `perf_event_open`.
-    /// This counter itself is for the dummy software event, so it's not
-    /// interesting.
-    file: File,
-
-    /// The unique id assigned to this group by the kernel. We only use this for
-    /// assertions.
-    id: u64,
-
-    /// An upper bound on the number of Counters in this group. This lets us
-    /// allocate buffers of sufficient size for for PERF_FORMAT_GROUP reads.
-    ///
-    /// There's no way to ask the kernel how many members a group has. And if we
-    /// pass a group read a buffer that's too small, the kernel won't just
-    /// return a truncated result; it returns ENOSPC and leaves the buffer
-    /// untouched. So the buffer just has to be large enough.
-    ///
-    /// Since we're borrowed while building group members, adding members can
-    /// increment this counter. But it's harder to decrement it when a member
-    /// gets dropped: we don't require that a Group outlive its members, so they
-    /// can't necessarily update their `Group`'s count from a `Drop` impl. So we
-    /// just increment, giving us an overestimate, and then correct the count
-    /// when we actually do a read.
-    ///
-    /// This includes the dummy counter for the group itself.
-    max_members: usize,
-}
+/// [`time_enabled`]: GroupData::time_enabled
+/// [`time_running`]: GroupData::time_running
+#[derive(Debug)]
+pub struct Group(pub(crate) Counter);
 
 /// A collection of counts from a [`Group`] of counters.
 ///
@@ -300,41 +270,61 @@ pub struct Counts {
 
 impl Group {
     /// Construct a new, empty `Group`.
-    #[allow(unused_parens)]
+    ///
+    /// The resulting `Group` is only suitable for observing the current process
+    /// on any CPU. If you need to build a `Group` with different settings you
+    /// will need to use [`Builder::build_group`].
     pub fn new() -> io::Result<Group> {
-        // Open a placeholder perf counter that we can add other events to.
-        let mut attrs = perf_event_attr {
-            size: std::mem::size_of::<perf_event_attr>() as u32,
-            type_: sys::bindings::PERF_TYPE_SOFTWARE,
-            config: sys::bindings::PERF_COUNT_SW_DUMMY as u64,
-            ..perf_event_attr::default()
-        };
+        Self::builder().build_group()
+    }
 
-        attrs.set_disabled(1);
-        attrs.set_exclude_kernel(1);
-        attrs.set_exclude_hv(1);
+    /// Construct a [Builder] preconfigured for creating a `Group`.
+    ///
+    /// Specifically, this creates a builder with the [`Software::DUMMY`] event
+    /// and with [`read_format`] set to `GROUP | ID | TOTAL_TIME_ENABLED |
+    /// TOTAL_TIME_RUNNING`. If you override [`read_format`] you will need to
+    /// ensure that [`ReadFormat::GROUP`] is set, otherwise [`build_group`] will
+    /// return an error.
+    ///
+    /// Note that any counter added to this group must observe the same set of
+    /// CPUs and processes as the group itself. That means if you configure the
+    /// group to observe a single CPU then the members of the group must also be
+    /// configured to only observe a single CPU, the same applies when choosing
+    /// target processes. Failing to follow this will result in an error when
+    /// adding the counter to the group.
+    ///
+    /// [`read_format`]: Builder::read_format
+    /// [`build_group`]: Builder::build_group
+    pub fn builder() -> Builder<'static> {
+        let mut builder = Builder::new();
+        builder.read_format(
+            ReadFormat::GROUP
+                | ReadFormat::TOTAL_TIME_ENABLED
+                | ReadFormat::TOTAL_TIME_RUNNING
+                | ReadFormat::ID,
+        );
 
-        // Arrange to be able to identify the counters we read back.
-        attrs.read_format = (sys::bindings::PERF_FORMAT_TOTAL_TIME_ENABLED
-            | sys::bindings::PERF_FORMAT_TOTAL_TIME_RUNNING
-            | sys::bindings::PERF_FORMAT_ID
-            | sys::bindings::PERF_FORMAT_GROUP) as u64;
+        builder
+    }
 
-        let file = unsafe {
-            File::from_raw_fd(check_errno_syscall(|| {
-                sys::perf_event_open(&mut attrs, 0, -1, -1, 0)
-            })?)
-        };
+    /// Access the internal counter for this group.
+    pub fn as_counter(&self) -> &Counter {
+        &self.0
+    }
 
-        // Retrieve the ID the kernel assigned us.
-        let mut id = 0_u64;
-        check_errno_syscall(|| unsafe { sys::ioctls::ID(file.as_raw_fd(), &mut id) })?;
+    /// Mutably access the internal counter for this group.
+    pub fn as_counter_mut(&mut self) -> &mut Counter {
+        &mut self.0
+    }
 
-        Ok(Group {
-            file,
-            id,
-            max_members: 1,
-        })
+    /// Convert this `Group` into its internal counter.
+    pub fn into_counter(self) -> Counter {
+        self.0
+    }
+
+    /// Return this group's kernel-assigned unique id.
+    pub fn id(&self) -> u64 {
+        self.0.id()
     }
 
     /// Allow all `Counter`s in this `Group` to begin counting their designated
@@ -346,28 +336,34 @@ impl Group {
     ///
     /// [`reset`]: #method.reset
     pub fn enable(&mut self) -> io::Result<()> {
-        self.generic_ioctl(sys::ioctls::ENABLE)
+        self.0.enable_group()
     }
 
     /// Make all `Counter`s in this `Group` stop counting their designated
     /// events, as a single atomic operation. Their counts are unaffected.
     pub fn disable(&mut self) -> io::Result<()> {
-        self.generic_ioctl(sys::ioctls::DISABLE)
+        self.0.disable_group()
     }
 
     /// Reset all `Counter`s in this `Group` to zero, as a single atomic operation.
     pub fn reset(&mut self) -> io::Result<()> {
-        self.generic_ioctl(sys::ioctls::RESET)
+        self.0.reset_group()
     }
 
-    /// Perform some group ioctl.
+    /// Construct a new counter as a part of this group.
     ///
-    /// `f` must be a syscall that sets `errno` and returns `-1` on failure.
-    fn generic_ioctl(&mut self, f: unsafe fn(c_int, c_uint) -> c_int) -> io::Result<()> {
-        check_errno_syscall(|| unsafe {
-            f(self.file.as_raw_fd(), sys::bindings::PERF_IOC_FLAG_GROUP)
-        })
-        .map(|_| ())
+    /// # Example
+    /// ```
+    /// use perf_event::events::Hardware;
+    /// use perf_event::{Builder, Group};
+    ///
+    /// let mut group = Group::new()?;
+    /// let counter = group.add(&Builder::new(Hardware::INSTRUCTIONS).any_cpu());
+    /// #
+    /// # std::io::Result::Ok(())
+    /// ```
+    pub fn add(&mut self, builder: &Builder) -> io::Result<Counter> {
+        builder.build_with_group(self)
     }
 
     /// Return the values of all the `Counter`s in this `Group` as a [`Counts`]
@@ -389,60 +385,32 @@ impl Group {
     /// ```
     ///
     /// [`Counts`]: struct.Counts.html
-    pub fn read(&mut self) -> io::Result<Counts> {
-        // Since we passed `PERF_FORMAT_{ID,GROUP,TOTAL_TIME_{ENABLED,RUNNING}}`,
-        // the data we'll read has the form:
-        //
-        //     struct read_format {
-        //         u64 nr;            /* The number of events */
-        //         u64 time_enabled;  /* if PERF_FORMAT_TOTAL_TIME_ENABLED */
-        //         u64 time_running;  /* if PERF_FORMAT_TOTAL_TIME_RUNNING */
-        //         struct {
-        //             u64 value;     /* The value of the event */
-        //             u64 id;        /* if PERF_FORMAT_ID */
-        //         } values[nr];
-        //     };
-        let mut data = vec![0_u64; 3 + 2 * self.max_members];
-        assert_eq!(
-            self.file.read(u64::slice_as_bytes_mut(&mut data))?,
-            std::mem::size_of_val(&data[..])
-        );
-
-        let counts = Counts { data };
-
-        // CountsIter assumes that the group's dummy count appears first.
-        assert_eq!(counts.nth_ref(0).0, self.id);
-
-        // Does the kernel ever return nonsense?
-        assert!(counts.time_running() <= counts.time_enabled());
-
-        // Update `max_members` for the next read.
-        self.max_members = counts.len();
-
-        Ok(counts)
-    }
-}
-
-impl std::fmt::Debug for Group {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            fmt,
-            "Group {{ fd: {}, id: {} }}",
-            self.file.as_raw_fd(),
-            self.id
-        )
+    pub fn read(&mut self) -> io::Result<GroupValue> {
+        self.0.read_group()
     }
 }
 
 impl AsRawFd for Group {
     fn as_raw_fd(&self) -> RawFd {
-        self.file.as_raw_fd()
+        self.0.as_raw_fd()
     }
 }
 
 impl IntoRawFd for Group {
     fn into_raw_fd(self) -> RawFd {
-        self.file.into_raw_fd()
+        self.0.into_raw_fd()
+    }
+}
+
+impl AsRef<Counter> for &'_ Group {
+    fn as_ref(&self) -> &Counter {
+        &self.0
+    }
+}
+
+impl AsMut<Counter> for &'_ mut Group {
+    fn as_mut(&mut self) -> &mut Counter {
+        &mut self.0
     }
 }
 

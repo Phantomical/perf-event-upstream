@@ -92,6 +92,7 @@ impl CounterValue {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct GroupValue<'a> {
     read_format: ReadFormat,
     time_enabled: u64,
@@ -134,12 +135,44 @@ impl<'a> GroupValue<'a> {
         self.into_iter().find(|entry| entry.id() == Some(id))
     }
 
+    pub fn get_value_by_id(&self, id: u64) -> Option<&u64> {
+        let iter = self.into_iter().iter;
+
+        iter.filter_map(|chunk| {
+            let entry = GroupEntry::new(self.read_format, chunk);
+            if entry.id == id {
+                Some(&chunk[0])
+            } else {
+                None
+            }
+        })
+        .next()
+    }
+
     pub fn into_owned(self) -> GroupValue<'static> {
         GroupValue {
             read_format: self.read_format,
             time_enabled: self.time_enabled,
             time_running: self.time_running,
             data: Cow::Owned(self.data.into_owned()),
+        }
+    }
+
+    pub(crate) fn without_data(self) -> GroupValue<'static> {
+        GroupValue {
+            read_format: self.read_format,
+            time_enabled: self.time_enabled,
+            time_running: self.time_running,
+            data: Cow::Borrowed(&[]),
+        }
+    }
+
+    pub(crate) fn with_data<'d>(self, data: Cow<'d, [u64]>) -> GroupValue<'d> {
+        GroupValue {
+            read_format: self.read_format,
+            time_enabled: self.time_enabled,
+            time_running: self.time_running,
+            data,
         }
     }
 
@@ -182,6 +215,7 @@ impl<'a> GroupValue<'a> {
     }
 }
 
+#[derive(Copy, Clone)]
 pub(crate) struct GroupEntry {
     read_format: ReadFormat,
     value: u64,
@@ -250,6 +284,22 @@ impl fmt::Debug for GroupEntry {
         }
 
         dbg.finish()
+    }
+}
+
+impl<'a> From<CounterValue> for GroupValue<'a> {
+    fn from(value: CounterValue) -> Self {
+        let mut data = Vec::with_capacity(3);
+        data.push(value.value());
+        data.extend(value.id());
+        data.extend(value.lost());
+
+        Self {
+            read_format: value.read_format | ReadFormat::GROUP,
+            time_enabled: value.time_enabled,
+            time_running: value.time_running,
+            data: Cow::Owned(data),
+        }
     }
 }
 

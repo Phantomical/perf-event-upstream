@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::convert::TryInto;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::iter::FusedIterator;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::time::Duration;
 
@@ -66,7 +68,7 @@ pub struct Counter {
     read_format: ReadFormat,
 
     /// If we are a `Group`, then this is the count of how many members we have.
-    member_count: u32,
+    pub(crate) member_count: u32,
 }
 
 impl Counter {
@@ -77,6 +79,24 @@ impl Counter {
             read_format,
             member_count: 1,
         }
+    }
+
+    /// Common initialization code shared between counters and groups.
+    pub(crate) fn new_internal(file: File, read_format: ReadFormat) -> std::io::Result<Self> {
+        let mut counter = Self {
+            file,
+            id: 0,
+            read_format,
+            member_count: 1,
+        };
+
+        // If we are part of a group then the id is used to find results in the
+        // Counts structure. Otherwise, it's just used for debug output.
+        let mut id = 0;
+        counter.ioctl(|fd| unsafe { ioctls::ID(fd, &mut id) })?;
+        counter.id = id;
+
+        Ok(counter)
     }
 
     /// Return this counter's kernel-assigned unique id.
@@ -192,6 +212,7 @@ impl Counter {
     {
         check_errno_syscall(|| ioctl(self.as_raw_fd())).map(drop)
     }
+
     /// Return this `Counter`'s current value as a `u64`.
     ///
     /// Consider using [`read_full`] or (if read_format has the required flags)
@@ -375,6 +396,60 @@ impl Counter {
                 })?
                 .as_nanos() as _,
         })
+    }
+
+    /// Read the values of all the counters in the current group.
+    ///
+    /// Note that unless [`ReadFormat::GROUP`] was specified when building this
+    /// `Counter` this will only read the data for the current `Counter`.
+    ///
+    /// # Errors
+    /// This function may return errors in the following notable cases:
+    /// - `ENOSPC` is returned if the `read_format` that this `Counter` was
+    ///   built with does not match the format of the data. This can also occur
+    ///   if `read_format` contained options not supported by this crate.
+    /// - If the counter is part of a group and was unable to be pinned to the
+    ///   CPU then reading will return an error with kind [`UnexpectedEof`].
+    ///
+    /// Other errors are also possible under unexpected conditions (e.g. `EBADF`
+    /// if the file descriptor is closed).
+    ///
+    /// [`UnexpectedEof`]: io::ErrorKind::UnexpectedEof
+    ///
+    /// # Example
+    /// Compute the CPI for a region of code:
+    /// ```
+    /// use perf_event::events::Hardware;
+    /// use perf_event::{Builder, ReadFormat};
+    ///
+    /// let mut instrs = Builder::new(Hardware::INSTRUCTIONS)
+    ///     .read_format(ReadFormat::GROUP)
+    ///     .build()?;
+    /// let mut cycles = Builder::new(Hardware::CPU_CYCLES).build_with_group(&mut instrs)?;
+    ///
+    /// instrs.enable_group()?;
+    /// // ...
+    /// instrs.disable_group()?;
+    ///
+    /// let data = instrs.read_group()?;
+    /// let instrs = data[&instrs];
+    /// let cycles = data[&cycles];
+    ///
+    /// println!("CPI: {}", cycles as f64 / instrs as f64);
+    /// # std::io::Result::Ok(())
+    /// ```
+    pub fn read_group(&mut self) -> io::Result<GroupValue> {
+        if self.is_group() {
+            let mut values = Vec::new();
+            let data = self
+                .do_read_group(&mut values)?
+                .without_data()
+                .with_data(Cow::Owned(values));
+
+            Ok(GroupValue::new(data))
+        } else {
+            Ok(GroupValue::new(self.do_read_single()?.0.into()))
+        }
     }
 
     fn is_group(&self) -> bool {
@@ -590,3 +665,236 @@ pub struct CountAndTime {
     /// value accordingly.
     pub time_running: u64,
 }
+
+#[derive(Clone)]
+pub struct GroupValue {
+    pub(crate) data: crate::read::GroupValue<'static>,
+    skip_first: bool,
+}
+
+impl GroupValue {
+    pub(crate) fn new(data: crate::read::GroupValue<'static>) -> Self {
+        Self {
+            data,
+            skip_first: false,
+        }
+    }
+
+    /// Return the number of counters this `GroupData` holds results for.
+    pub fn len(&self) -> usize {
+        self.iter().len()
+    }
+
+    /// Whether this `GroupData` is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The duration for which the group was enabled.
+    ///
+    /// This will only be present if [`TOTAL_TIME_ENABLED`] was passed to
+    /// [`read_format`].
+    ///
+    /// [`TOTAL_TIME_ENABLED`]: ReadFormat::TOTAL_TIME_ENABLED
+    /// [`read_format`]: Builder::read_format
+    pub fn time_enabled(&self) -> Option<Duration> {
+        self.data.time_enabled().map(Duration::from_nanos)
+    }
+
+    /// The duration for which the group was scheduled on the CPU.
+    ///
+    /// This will only be present if [`TOTAL_TIME_RUNNING`] was passed to
+    /// [`read_format`].
+    ///
+    /// [`TOTAL_TIME_RUNNING`]: ReadFormat::TOTAL_TIME_RUNNING
+    /// [`read_format`]: Builder::read_format
+    pub fn time_running(&self) -> Option<Duration> {
+        self.data.time_running().map(Duration::from_nanos)
+    }
+
+    /// Get the entry for `member` in `self`, or `None` if `member` is not
+    /// present.
+    ///
+    /// `member` can be either a `Counter` or a `Group`.
+    ///
+    /// If you know the counter is in the group then you can access the count
+    /// via indexing.
+    /// ```
+    /// use perf_event::events::Hardware;
+    /// use perf_event::{Builder, Group};
+    ///
+    /// let mut group = Group::new()?;
+    /// let instrs = Builder::new(Hardware::INSTRUCTIONS).build_with_group(&mut group)?;
+    /// let cycles = Builder::new(Hardware::CPU_CYCLES).build_with_group(&mut group)?;
+    /// group.enable()?;
+    /// // ...
+    /// let counts = group.read()?;
+    /// let instrs = counts[&instrs];
+    /// let cycles = counts[&cycles];
+    /// # std::io::Result::Ok(())
+    /// ```
+    pub fn get(&self, member: &Counter) -> Option<GroupEntry> {
+        self.data.get_by_id(member.id()).map(GroupEntry)
+    }
+
+    /// Return an iterator over all entries in `self`.
+    ///
+    /// For compatibility reasons, if this `GroupData` was returned by reading
+    /// from a [`Group`] then the iterator will skip the group counter itself.
+    /// Normally this is what you want since the [`Group`] is usually a dummy
+    /// counter. This does not apply if this `GroupData` was returned from a
+    /// [`read_group`](Counter::read_group) call on a [`Counter`].
+    ///
+    /// # Example
+    /// ```
+    /// # use perf_event::Group;
+    /// # let mut group = Group::new()?;
+    /// let data = group.read()?;
+    /// for entry in &data {
+    ///     println!("Counter with id {} has value {}", entry.id(), entry.value());
+    /// }
+    /// # std::io::Result::Ok(())
+    /// ```
+    pub fn iter(&self) -> GroupIter {
+        let mut iter = self.iter_with_group();
+        if self.skip_first {
+            let _ = iter.next();
+        }
+        iter
+    }
+
+    fn iter_with_group(&self) -> GroupIter {
+        GroupIter((&self.data).into_iter())
+    }
+
+    /// Mark that the first counter in this group is a `Group` and should not be
+    /// included when iterating over this `GroupData` instance.
+    pub(crate) fn skip_group(&mut self) {
+        self.skip_first = true;
+    }
+}
+
+/// Individual entry for a counter returned by [`Group::read`].
+#[derive(Copy, Clone)]
+pub struct GroupEntry(pub(crate) crate::read::GroupEntry);
+
+impl GroupEntry {
+    /// The value of the counter.
+    pub fn value(&self) -> u64 {
+        self.0.value()
+    }
+
+    /// The kernel-assigned unique id of the counter that was read.
+    pub fn id(&self) -> u64 {
+        self.0.id().expect("group entry did not have an id")
+    }
+
+    /// The number of lost samples for this event.
+    pub fn lost(&self) -> Option<u64> {
+        self.0.lost()
+    }
+}
+
+impl std::ops::Index<&Counter> for GroupValue {
+    type Output = u64;
+
+    fn index(&self, ctr: &Counter) -> &u64 {
+        self.data
+            .get_value_by_id(ctr.id())
+            .unwrap_or_else(|| panic!("group contained no counter with id {}", ctr.id()))
+    }
+}
+
+impl fmt::Debug for GroupValue {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        struct GroupEntries<'a>(&'a GroupValue);
+
+        impl fmt::Debug for GroupEntries<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_list().entries(self.0.iter()).finish()
+            }
+        }
+
+        let mut dbg = fmt.debug_struct("GroupData");
+
+        if let Some(time_enabled) = self.time_enabled() {
+            dbg.field("time_enabled", &time_enabled.as_nanos());
+        }
+
+        if let Some(time_running) = self.time_running() {
+            dbg.field("time_running", &time_running.as_nanos());
+        }
+
+        dbg.field("entries", &GroupEntries(self));
+        dbg.finish()
+    }
+}
+
+impl<'a> IntoIterator for &'a GroupValue {
+    type IntoIter = GroupIter<'a>;
+    type Item = <GroupIter<'a> as Iterator>::Item;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl fmt::Debug for GroupEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut dbg = f.debug_struct("GroupEntry");
+        dbg.field("value", &self.value());
+        dbg.field("id", &self.id());
+
+        if let Some(lost) = self.lost() {
+            dbg.field("lost", &lost);
+        }
+
+        dbg.finish_non_exhaustive()
+    }
+}
+
+/// Iterator over the entries contained within [`GroupData`].
+#[derive(Clone)]
+pub struct GroupIter<'a>(crate::read::GroupIter<'a>);
+
+impl<'a> Iterator for GroupIter<'a> {
+    type Item = GroupEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(GroupEntry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.0.count()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.0.nth(n).map(GroupEntry)
+    }
+
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+}
+
+impl<'a> DoubleEndedIterator for GroupIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(GroupEntry)
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        self.0.nth_back(n).map(GroupEntry)
+    }
+}
+
+impl<'a> ExactSizeIterator for GroupIter<'a> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> FusedIterator for GroupIter<'a> {}
